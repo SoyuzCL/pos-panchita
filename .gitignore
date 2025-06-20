@@ -1,0 +1,18 @@
+# Archivos de configuración con datos sensibles
+config.ini
+.env
+secrets.json
+
+# Carpetas de dependencias (ejemplos para distintos lenguajes)
+/node_modules
+/vendor
+/venv
+/__pycache__/
+
+# Archivos de logs
+*.log
+debug.log
+
+# Archivos del sistema operativo
+.DS_Store
+Thumbs.db
