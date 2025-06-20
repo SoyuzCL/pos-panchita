@@ -7,11 +7,31 @@ const { v4: uuidv4 } = require('uuid');
 const bcrypt = require('bcryptjs'); 
 const jwt = require('jsonwebtoken');
 
-// --- NUEVO: Importar la librería para la impresora térmica ---
-const { ThermalPrinter, PrinterTypes, CharacterSet } = require("node-thermal-printer");
-
 const app = express();
 const PORT = process.env.PORT || 3001;
+
+// En tu archivo server.js
+
+const allowedOrigins = [
+  'http://localhost:5173', // Puerto por defecto para tu POS-Frontend
+  'http://localhost:5174', // Puerto por defecto para tu POS-Monitor
+
+  // ASEGÚRATE DE QUE ESTA LÍNEA EXISTA Y TENGA EL PUERTO CORRECTO (5173)
+  'http://192.168.1.8:5173'  // <--- Esta es la línea clave.
+];
+
+const corsOptions = {
+  origin: (origin, callback) => {
+    // Permite solicitudes sin origen (como Postman o apps móviles)
+    if (!origin) return callback(null, true);
+    if (allowedOrigins.indexOf(origin) === -1) {
+      const msg = 'La política de CORS para este sitio no permite acceso desde el origen especificado.';
+      return callback(new Error(msg), false);
+    }
+    return callback(null, true);
+  },
+  optionsSuccessStatus: 200 
+};
 
 // --- Configuración de la Base de Datos PostgreSQL ---
 const pool = new Pool({
@@ -201,6 +221,7 @@ apiRouter.post('/sales', authenticateToken, async (req, res) => {
         let saleEmployeeId = req.user.id;
         let authorizingAdminName = null;
 
+        // Handle special sale authorization
         if (payment_method === 'venta especial') {
             if (!adminRut || !adminPassword) {
                 throw new Error('Se requieren credenciales de administrador para una venta especial.');
@@ -214,10 +235,12 @@ apiRouter.post('/sales', authenticateToken, async (req, res) => {
             if (!isPasswordMatch) {
                 throw new Error('Contraseña de administrador incorrecta.');
             }
+            // If valid, the sale is registered under the admin's ID
             saleEmployeeId = admin.id;
             authorizingAdminName = `${admin.first_name} ${admin.last_name || ''}`.trim();
         }
 
+        // Update cash balance only for cash payments
         if (payment_method === 'efectivo') {
             const { rowCount: sessionRowCount } = await client.query(
                 'UPDATE cash_sessions SET current_balance = current_balance + $1 WHERE is_active = true',
@@ -226,9 +249,11 @@ apiRouter.post('/sales', authenticateToken, async (req, res) => {
             if (sessionRowCount === 0) throw new Error('No se encontró una sesión de caja activa.');
         }
 
+        // Insert the sale record
         const saleQuery = `INSERT INTO sales (id, total_amount, net_amount, employee_id, payment_method) VALUES ($1, $2, $2 / 1.19, $3, $4) RETURNING id, sale_date;`;
         const { rows: [newSale] } = await client.query(saleQuery, [uuidv4(), total_amount, saleEmployeeId, payment_method]);
 
+        // Insert sale items and update stock
         for (const item of items) {
             await client.query('INSERT INTO sale_items (sale_id, product_id, quantity, price_at_sale) VALUES ($1, $2, $3, $4)', [newSale.id, item.product_id, item.quantity, item.price_at_sale]);
             
@@ -244,6 +269,7 @@ apiRouter.post('/sales', authenticateToken, async (req, res) => {
             if (rowCount === 0) throw new Error(`Stock insuficiente para el producto ID ${item.product_id}.`);
         }
         
+        // Log the action
         let logDetails = `Venta procesada por $${total_amount} con método '${payment_method}'.`;
         if (payment_method === 'venta especial') {
             logDetails += ` Autorizada por: ${authorizingAdminName}. Registrada por (cajero): ${req.user.name}.`;
@@ -259,93 +285,6 @@ apiRouter.post('/sales', authenticateToken, async (req, res) => {
         client.release();
     }
 });
-
-// --- NUEVO: Ruta para imprimir el recibo y abrir la caja de dinero ---
-apiRouter.post('/print-receipt', authenticateToken, async (req, res) => {
-    const { items, total_amount, payment_method, change, amountPaid } = req.body;
-
-    let printer;
-    try {
-        // Inicializar la impresora. 'usb' intentará autodetectarla.
-        printer = new ThermalPrinter({
-            type: PrinterTypes.EPSON, // La mayoría de las impresoras de 58mm usan comandos Epson (ESC/POS)
-            interface: 'usb',         
-            characterSet: CharacterSet.PC852_LATIN2, // Buen set de caracteres para español (ñ, acentos)
-            removeSpecialCharacters: false,
-            lineCharacter: "-", 
-            options:{
-              timeout: 5000
-            }
-        });
-
-        const isConnected = await printer.isPrinterConnected();
-        if (!isConnected) {
-            console.error("Printer not connected!");
-            // No se envía un error 500 para no alarmar al usuario en el frontend,
-            // ya que la venta SÍ se guardó. Solo se registra el fallo.
-            return res.status(202).json({ message: "La venta se guardó, pero no se pudo conectar con la impresora." });
-        }
-
-        // --- Construcción del recibo ---
-        printer.alignCenter();
-        printer.bold(true);
-        printer.println("PANCHITA"); // Nombre de la tienda
-        printer.bold(false);
-        printer.println("Dirección de ejemplo, 123");
-        printer.println(`Fecha: ${new Date().toLocaleString('es-CL')}`);
-        printer.drawLine();
-
-        printer.alignLeft();
-        // Encabezados de la tabla de items
-        printer.tableCustom([
-            { text: "Cant", align: "LEFT", width: 0.1 },
-            { text: "Producto", align: "LEFT", width: 0.6 },
-            { text: "Total", align: "RIGHT", width: 0.25 }
-        ]);
-
-        items.forEach(item => {
-            printer.tableCustom([
-                { text: `${item.quantity}`, align: "LEFT" },
-                { text: `${item.name}`, align: "LEFT" },
-                { text: `$${(item.price * item.quantity).toFixed(0)}`, align: "RIGHT" }
-            ]);
-        });
-        printer.drawLine();
-        
-        printer.alignRight();
-        printer.bold(true);
-        printer.println(`TOTAL: $${total_amount.toFixed(0)}`);
-        printer.bold(false);
-
-        if (payment_method === 'efectivo') {
-            printer.println(`Paga con: $${amountPaid.toFixed(0)}`);
-            printer.println(`Cambio: $${change.toFixed(0)}`);
-        } else {
-             printer.println(`Pagado con: ${payment_method}`);
-        }
-        
-        printer.feed(2); 
-        printer.alignCenter();
-        printer.println("¡Gracias por su compra!");
-        
-        // Abrir la caja de dinero solo para pagos en efectivo
-        if (payment_method === 'efectivo') {
-            printer.openCashDrawer();
-        }
-
-        printer.cut(); 
-        
-        await printer.execute();
-        
-        console.log("Print success!");
-        res.status(200).json({ message: "Recibo impreso correctamente." });
-
-    } catch (error) {
-        console.error("Print failed:", error);
-        res.status(500).json({ message: 'Error al procesar la impresión', error: error.message });
-    }
-});
-
 
 apiRouter.get('/products/low-stock', authenticateToken, async (req, res) => {
     const LOW_STOCK_THRESHOLD = 5;
@@ -408,10 +347,13 @@ apiRouter.put('/products/:id', authenticateToken, async (req, res) => {
         const sellingPrice = recalculate_price ? calculateSellingPrice(finalCostPrice) : oldProduct.selling_price;
         const newStock = parseInt(stock, 10);
 
+        // --- CAMBIO: Lógica para activar/desactivar automáticamente ---
         let newIsActive = oldProduct.is_active;
+        // Si el stock era 0 o menos y ahora es positivo, activar producto.
         if (parseInt(oldProduct.stock, 10) <= 0 && newStock > 0) {
             newIsActive = true;
         } 
+        // Si el stock se establece en 0 o menos, desactivar producto.
         else if (newStock <= 0) {
             newIsActive = false;
         }
@@ -441,6 +383,7 @@ apiRouter.patch('/products/:id/toggle-status', authenticateToken, async (req, re
 
         const newStatus = !product.is_active;
 
+        // Regla de negocio: No se puede activar un producto si no tiene stock.
         if (newStatus === true && parseInt(product.stock, 10) <= 0) {
             return res.status(400).json({ message: 'No se puede activar un producto sin stock.' });
         }
@@ -490,9 +433,13 @@ apiRouter.get('/suppliers', authenticateToken, async (req, res) => {
     catch(e) { res.status(500).json({message: e.message}) }
 });
 
+// --- <<<<<<<<<<<<<<< NUEVAS RUTAS DE PEDIDOS >>>>>>>>>>>>>>>> ---
+
+// --- PEDIDOS A PROVEEDORES (PURCHASE ORDERS) ---
 const purchaseOrderRouter = express.Router();
 purchaseOrderRouter.use(authenticateToken);
 
+// GET all purchase orders
 purchaseOrderRouter.get('/', async (req, res) => {
     try {
         const query = `
@@ -508,6 +455,7 @@ purchaseOrderRouter.get('/', async (req, res) => {
     }
 });
 
+// POST new purchase order
 purchaseOrderRouter.post('/', async (req, res) => {
     const { supplier_id, expected_delivery_date, notes, items, total_cost } = req.body;
     const client = await pool.connect();
@@ -538,19 +486,22 @@ purchaseOrderRouter.post('/', async (req, res) => {
     }
 });
 
+// PUT receive items for a purchase order
 purchaseOrderRouter.put('/:id/receive', async (req, res) => {
     const { id: purchase_order_id } = req.params;
-    const { items_received } = req.body;
+    const { items_received } = req.body; // Array of { item_id, quantity_received }
     const client = await pool.connect();
     try {
         await client.query('BEGIN');
 
         for (const item of items_received) {
+            // Update quantity received in the order item
             await client.query(
                 'UPDATE purchase_order_items SET quantity_received = quantity_received + $1 WHERE id = $2',
                 [item.quantity_received, item.item_id]
             );
 
+            // Update product stock
             const { rows: [poItem] } = await client.query('SELECT product_id FROM purchase_order_items WHERE id = $1', [item.item_id]);
             await client.query(
                 'UPDATE products SET stock = stock + $1 WHERE id = $2',
@@ -558,6 +509,7 @@ purchaseOrderRouter.put('/:id/receive', async (req, res) => {
             );
         }
 
+        // Check if the order is fully or partially received
         const { rows: allItems } = await client.query('SELECT quantity_ordered, quantity_received FROM purchase_order_items WHERE purchase_order_id = $1', [purchase_order_id]);
         const totalOrdered = allItems.reduce((sum, i) => sum + i.quantity_ordered, 0);
         const totalReceived = allItems.reduce((sum, i) => sum + i.quantity_received, 0);
@@ -582,13 +534,17 @@ purchaseOrderRouter.put('/:id/receive', async (req, res) => {
 
 apiRouter.use('/purchase-orders', purchaseOrderRouter);
 
+
+// --- PEDIDOS DE CLIENTES (CUSTOMER ORDERS) ---
 const customerOrderRouter = express.Router();
 customerOrderRouter.use(authenticateToken);
 
+// GET all customer orders
 customerOrderRouter.get('/', async (req, res) => {
     try {
         const query = `SELECT * FROM customer_orders ORDER BY delivery_date ASC`;
         const { rows } = await pool.query(query);
+        // Also fetch items for each order
         const ordersWithItems = await Promise.all(rows.map(async (order) => {
             const itemsResult = await pool.query('SELECT * FROM customer_order_items WHERE order_id = $1', [order.id]);
             return { ...order, items: itemsResult.rows };
@@ -599,6 +555,7 @@ customerOrderRouter.get('/', async (req, res) => {
     }
 });
 
+// POST new customer order
 customerOrderRouter.post('/', async (req, res) => {
     const { customer_name, customer_phone, delivery_date, total_amount, down_payment, notes, items } = req.body;
     const client = await pool.connect();
@@ -629,6 +586,7 @@ customerOrderRouter.post('/', async (req, res) => {
     }
 });
 
+// PUT update customer order status
 customerOrderRouter.put('/:id/status', async (req, res) => {
     const { id } = req.params;
     const { status } = req.body;
