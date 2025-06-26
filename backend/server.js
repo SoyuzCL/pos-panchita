@@ -4,41 +4,42 @@ const { Pool } = require('pg');
 const cors = require('cors');
 require('dotenv').config();
 const { v4: uuidv4 } = require('uuid');
-const bcrypt = require('bcryptjs'); 
+const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 
 const app = express();
 const PORT = process.env.PORT || 3001;
 
-// En tu archivo server.js
-
+// --- Configuración de CORS ---
+// Lista de orígenes permitidos
 const allowedOrigins = [
   'http://localhost:5173', // Puerto por defecto para tu POS-Frontend
   'http://localhost:5174', // Puerto por defecto para tu POS-Monitor
-
-  // ASEGÚRATE DE QUE ESTA LÍNEA EXISTA Y TENGA EL PUERTO CORRECTO (5173)
-  'http://192.168.1.8:5173'  // <--- Esta es la línea clave.
+  'http://192.168.1.10:5173',
+  'http://172.20.10.8:5173'
 ];
 
 const corsOptions = {
   origin: (origin, callback) => {
-    // Permite solicitudes sin origen (como Postman o apps móviles)
-    if (!origin) return callback(null, true);
-    if (allowedOrigins.indexOf(origin) === -1) {
-      const msg = 'La política de CORS para este sitio no permite acceso desde el origen especificado.';
-      return callback(new Error(msg), false);
+    if (!origin || allowedOrigins.indexOf(origin) !== -1) {
+      callback(null, true);
+    } else {
+      callback(new Error('Not allowed by CORS'));
     }
-    return callback(null, true);
   },
-  optionsSuccessStatus: 200 
+  optionsSuccessStatus: 200
 };
+
+app.use(cors(corsOptions));
+app.use(express.json());
+
 
 // --- Configuración de la Base de Datos PostgreSQL ---
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
 });
 
-// --- Helper functions ---
+// --- Funciones Auxiliares ---
 const logAction = async (employeeId, employeeName, actionType, details) => {
     try {
         await pool.query('INSERT INTO action_logs (employee_id, employee_name, action_type, details) VALUES ($1, $2, $3, $4)', [employeeId, employeeName, actionType, details]);
@@ -61,14 +62,10 @@ const formatProductForFrontend = (dbProduct) => {
   };
 };
 
-// --- Middlewares ---
-app.use(cors());
-app.use(express.json());
-
 // --- Middleware de Autenticación ---
 const authenticateToken = (req, res, next) => {
     const authHeader = req.headers['authorization'];
-    const token = authHeader && authHeader.split(' ')[1]; 
+    const token = authHeader && authHeader.split(' ')[1];
     if (token == null) return res.sendStatus(401);
     jwt.verify(token, process.env.JWT_SECRET, (err, user) => {
         if (err) return res.sendStatus(403);
@@ -77,33 +74,115 @@ const authenticateToken = (req, res, next) => {
     });
 };
 
+// --- Middleware para restringir a administradores ---
+const isAdmin = (req, res, next) => {
+    if (req.user.role !== 'admin') {
+        return res.status(403).json({ message: 'Acceso denegado. Se requiere rol de administrador.' });
+    }
+    next();
+};
+
+
 // --- Rutas de la API ---
 const apiRouter = express.Router();
 app.use('/api', apiRouter);
 
 // --- Rutas de Autenticación ---
-apiRouter.post('/register', async (req, res) => {
-    const { first_name, last_name, rut, role, password } = req.body;
-    if (!first_name || !rut || !role || !password) return res.status(400).json({ message: 'All fields are required' });
-    try {
-        const hashedPassword = await bcrypt.hash(password, 10);
-        const result = await pool.query('INSERT INTO employees (id, first_name, last_name, rut, role, password_hash) VALUES ($1, $2, $3, $4, $5, $6) RETURNING id, first_name, role;', [uuidv4(), first_name, last_name, rut, role, hashedPassword]);
-        res.status(201).json(result.rows[0]);
-    } catch (err) { res.status(500).json({ message: 'Error registering employee', error: err.message }); }
-});
 apiRouter.post('/login', async (req, res) => {
     const { rut, password } = req.body;
     try {
         const result = await pool.query('SELECT * FROM employees WHERE rut = $1 AND is_active = true', [rut]);
-        if (result.rows.length === 0) return res.status(400).json({ message: 'Invalid credentials' });
+        if (result.rows.length === 0) return res.status(400).json({ message: 'Credenciales inválidas' });
         const employee = result.rows[0];
         const isMatch = await bcrypt.compare(password, employee.password_hash);
-        if (!isMatch) return res.status(400).json({ message: 'Invalid credentials' });
+        if (!isMatch) return res.status(400).json({ message: 'Credenciales inválidas' });
         const userPayload = { id: employee.id, name: `${employee.first_name} ${employee.last_name || ''}`.trim(), role: employee.role };
         const token = jwt.sign(userPayload, process.env.JWT_SECRET, { expiresIn: '8h' });
         res.json({ token, user: userPayload });
-    } catch (err) { res.status(500).json({ message: 'Server Error' }); }
+    } catch (err) { res.status(500).json({ message: 'Error del servidor' }); }
 });
+
+
+// =================================================================
+// --- CRUD DE EMPLEADOS (USUARIOS) ---
+// =================================================================
+const employeeRouter = express.Router();
+employeeRouter.use(authenticateToken);
+employeeRouter.use(isAdmin); // Solo administradores pueden gestionar usuarios
+
+// GET - Obtener todos los empleados
+employeeRouter.get('/', async (req, res) => {
+    try {
+        const { rows } = await pool.query('SELECT id, first_name, last_name, rut, role, is_active, created_at FROM employees ORDER BY first_name, last_name');
+        res.json(rows);
+    } catch (err) {
+        res.status(500).json({ message: 'Error al obtener empleados', error: err.message });
+    }
+});
+
+// POST - Crear un nuevo empleado (reemplaza /register)
+employeeRouter.post('/', async (req, res) => {
+    const { first_name, last_name, rut, role, password } = req.body;
+    if (!first_name || !rut || !role || !password) {
+        return res.status(400).json({ message: 'Nombre, RUT, rol y contraseña son requeridos.' });
+    }
+    try {
+        const hashedPassword = await bcrypt.hash(password, 10);
+        const query = 'INSERT INTO employees (id, first_name, last_name, rut, role, password_hash) VALUES ($1, $2, $3, $4, $5, $6) RETURNING id, first_name, last_name, rut, role, is_active, created_at';
+        const { rows } = await pool.query(query, [uuidv4(), first_name, last_name || '', rut, role, hashedPassword]);
+        await logAction(req.user.id, req.user.name, 'EMPLOYEE_CREATE', `Creó al usuario '${first_name} ${last_name}' con RUT ${rut}.`);
+        res.status(201).json(rows[0]);
+    } catch (err) {
+        if (err.code === '23505') { // Error de violación de unicidad (ej. RUT duplicado)
+            return res.status(409).json({ message: 'El RUT ingresado ya existe.' });
+        }
+        res.status(500).json({ message: 'Error al registrar empleado', error: err.message });
+    }
+});
+
+// PUT - Actualizar un empleado
+employeeRouter.put('/:id', async (req, res) => {
+    const { id } = req.params;
+    const { first_name, last_name, rut, role, is_active, password } = req.body;
+     if (!first_name || !rut || !role || is_active === undefined) {
+        return res.status(400).json({ message: 'Nombre, RUT, rol y estado son requeridos.' });
+    }
+
+    try {
+        let hashedPassword = undefined;
+        if (password) {
+            hashedPassword = await bcrypt.hash(password, 10);
+        }
+
+        const currentDataQuery = await pool.query('SELECT * FROM employees WHERE id = $1', [id]);
+        if (currentDataQuery.rows.length === 0) {
+            return res.status(404).json({ message: 'Empleado no encontrado' });
+        }
+
+        const updateFields = [first_name, last_name || '', rut, role, is_active];
+        let query;
+        if (hashedPassword) {
+            query = `UPDATE employees SET first_name = $1, last_name = $2, rut = $3, role = $4, is_active = $5, password_hash = $6 WHERE id = $7 RETURNING id, first_name, last_name, rut, role, is_active, created_at`;
+            updateFields.push(hashedPassword, id);
+        } else {
+            query = `UPDATE employees SET first_name = $1, last_name = $2, rut = $3, role = $4, is_active = $5 WHERE id = $6 RETURNING id, first_name, last_name, rut, role, is_active, created_at`;
+            updateFields.push(id);
+        }
+        
+        const { rows } = await pool.query(query, updateFields);
+        await logAction(req.user.id, req.user.name, 'EMPLOYEE_UPDATE', `Actualizó datos del usuario con RUT ${rut}.`);
+        res.json(rows[0]);
+
+    } catch (err) {
+        if (err.code === '23505') {
+            return res.status(409).json({ message: 'El RUT ingresado ya pertenece a otro usuario.' });
+        }
+        res.status(500).json({ message: 'Error al actualizar empleado', error: err.message });
+    }
+});
+
+apiRouter.use('/employees', employeeRouter);
+
 
 // --- Rutas de Gestión de Caja ---
 apiRouter.get('/cash-sessions/active', authenticateToken, async (req, res) => {
@@ -194,7 +273,6 @@ apiRouter.post('/cash-movements', authenticateToken, async (req, res) => {
     }
 });
 
-
 // --- Rutas de Productos ---
 apiRouter.post('/products', authenticateToken, async (req, res) => {
     const { name, code, category, cost_price, stock, supplier_id, fecha_vencimiento } = req.body;
@@ -221,7 +299,6 @@ apiRouter.post('/sales', authenticateToken, async (req, res) => {
         let saleEmployeeId = req.user.id;
         let authorizingAdminName = null;
 
-        // Handle special sale authorization
         if (payment_method === 'venta especial') {
             if (!adminRut || !adminPassword) {
                 throw new Error('Se requieren credenciales de administrador para una venta especial.');
@@ -235,12 +312,10 @@ apiRouter.post('/sales', authenticateToken, async (req, res) => {
             if (!isPasswordMatch) {
                 throw new Error('Contraseña de administrador incorrecta.');
             }
-            // If valid, the sale is registered under the admin's ID
             saleEmployeeId = admin.id;
             authorizingAdminName = `${admin.first_name} ${admin.last_name || ''}`.trim();
         }
 
-        // Update cash balance only for cash payments
         if (payment_method === 'efectivo') {
             const { rowCount: sessionRowCount } = await client.query(
                 'UPDATE cash_sessions SET current_balance = current_balance + $1 WHERE is_active = true',
@@ -249,11 +324,9 @@ apiRouter.post('/sales', authenticateToken, async (req, res) => {
             if (sessionRowCount === 0) throw new Error('No se encontró una sesión de caja activa.');
         }
 
-        // Insert the sale record
         const saleQuery = `INSERT INTO sales (id, total_amount, net_amount, employee_id, payment_method) VALUES ($1, $2, $2 / 1.19, $3, $4) RETURNING id, sale_date;`;
         const { rows: [newSale] } = await client.query(saleQuery, [uuidv4(), total_amount, saleEmployeeId, payment_method]);
 
-        // Insert sale items and update stock
         for (const item of items) {
             await client.query('INSERT INTO sale_items (sale_id, product_id, quantity, price_at_sale) VALUES ($1, $2, $3, $4)', [newSale.id, item.product_id, item.quantity, item.price_at_sale]);
             
@@ -269,7 +342,6 @@ apiRouter.post('/sales', authenticateToken, async (req, res) => {
             if (rowCount === 0) throw new Error(`Stock insuficiente para el producto ID ${item.product_id}.`);
         }
         
-        // Log the action
         let logDetails = `Venta procesada por $${total_amount} con método '${payment_method}'.`;
         if (payment_method === 'venta especial') {
             logDetails += ` Autorizada por: ${authorizingAdminName}. Registrada por (cajero): ${req.user.name}.`;
@@ -290,19 +362,13 @@ apiRouter.get('/products/low-stock', authenticateToken, async (req, res) => {
     const LOW_STOCK_THRESHOLD = 5;
     try {
         const query = `
-            SELECT 
-                id, name, stock
-            FROM products 
-            WHERE 
-                is_active = true
-                AND stock > 0
-                AND stock <= $1
+            SELECT id, name, stock FROM products 
+            WHERE is_active = true AND stock > 0 AND stock <= $1
             ORDER BY stock ASC;
         `;
         const { rows } = await pool.query(query, [LOW_STOCK_THRESHOLD]);
         res.json(rows);
     } catch (err) {
-        console.error('Error fetching low stock products:', err);
         res.status(500).json({ message: 'Error fetching low stock products', error: err.message });
     }
 });
@@ -310,19 +376,14 @@ apiRouter.get('/products/low-stock', authenticateToken, async (req, res) => {
 apiRouter.get('/products/expiring-soon', authenticateToken, async (req, res) => {
     try {
         const query = `
-            SELECT 
-                id, name, stock, fecha_vencimiento 
-            FROM products 
-            WHERE 
-                fecha_vencimiento IS NOT NULL 
-                AND is_active = true
-                AND fecha_vencimiento BETWEEN NOW() AND NOW() + interval '30 day' 
+            SELECT id, name, stock, fecha_vencimiento FROM products 
+            WHERE fecha_vencimiento IS NOT NULL AND is_active = true
+            AND fecha_vencimiento BETWEEN NOW() AND NOW() + interval '30 day' 
             ORDER BY fecha_vencimiento ASC;
         `;
         const { rows } = await pool.query(query);
         res.json(rows);
     } catch (err) {
-        console.error('Error fetching expiring products:', err);
         res.status(500).json({ message: 'Error fetching expiring products', error: err.message });
     }
 });
@@ -346,14 +407,10 @@ apiRouter.put('/products/:id', authenticateToken, async (req, res) => {
         const finalCostPrice = parseFloat(cost_price);
         const sellingPrice = recalculate_price ? calculateSellingPrice(finalCostPrice) : oldProduct.selling_price;
         const newStock = parseInt(stock, 10);
-
-        // --- CAMBIO: Lógica para activar/desactivar automáticamente ---
         let newIsActive = oldProduct.is_active;
-        // Si el stock era 0 o menos y ahora es positivo, activar producto.
         if (parseInt(oldProduct.stock, 10) <= 0 && newStock > 0) {
             newIsActive = true;
         } 
-        // Si el stock se establece en 0 o menos, desactivar producto.
         else if (newStock <= 0) {
             newIsActive = false;
         }
@@ -361,14 +418,13 @@ apiRouter.put('/products/:id', authenticateToken, async (req, res) => {
         const query = `
             UPDATE products 
             SET name = $1, code = $2, category = $3, cost_price = $4, stock = $5, supplier_id = $6, selling_price = $7, fecha_vencimiento = $8, is_active = $9
-            WHERE id = $10 
-            RETURNING *;`;
+            WHERE id = $10 RETURNING *;`;
         const { rows } = await pool.query(query, [name, code, category, finalCostPrice, newStock, supplier_id, sellingPrice, fecha_vencimiento || null, newIsActive, id]);
         
         let details = [`'${name}' actualizado.`];
         if (oldProduct.stock != newStock) details.push(`Stock: ${oldProduct.stock} -> ${newStock}.`);
         if (oldProduct.cost_price != cost_price) details.push(`Costo: $${oldProduct.cost_price} -> $${cost_price}.`);
-        if(oldProduct.is_active !== newIsActive) details.push(`Estado cambiado automáticamente a ${newIsActive ? 'Activo' : 'Inactivo'}.`);
+        if(oldProduct.is_active !== newIsActive) details.push(`Estado cambiado a ${newIsActive ? 'Activo' : 'Inactivo'}.`);
 
         await logAction(req.user.id, req.user.name, 'PRODUCT_UPDATE', details.join(' '));
         res.json(formatProductForFrontend(rows[0]));
@@ -382,20 +438,16 @@ apiRouter.patch('/products/:id/toggle-status', authenticateToken, async (req, re
         if (!product) return res.status(404).json({ message: 'Product not found' });
 
         const newStatus = !product.is_active;
-
-        // Regla de negocio: No se puede activar un producto si no tiene stock.
         if (newStatus === true && parseInt(product.stock, 10) <= 0) {
             return res.status(400).json({ message: 'No se puede activar un producto sin stock.' });
         }
 
         const { rows: [updatedProduct] } = await pool.query('UPDATE products SET is_active = $1 WHERE id = $2 RETURNING *', [newStatus, id]);
-
         const action = newStatus ? 'PRODUCT_ACTIVATE' : 'PRODUCT_DEACTIVATE';
         await logAction(req.user.id, req.user.name, action, `Cambió el estado de '${updatedProduct.name}' a ${newStatus ? 'Activo' : 'Inactivo'}.`);
         
         res.json(formatProductForFrontend(updatedProduct));
     } catch (err) {
-        console.error('Error toggling product status:', err);
         res.status(500).json({ message: err.message });
     }
 });
@@ -423,7 +475,6 @@ apiRouter.get('/sales', authenticateToken, async (req, res) => {
         combinedFeed.sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime());
         res.json(combinedFeed);
     } catch (err) {
-        console.error('Error fetching combined reports:', err);
         res.status(500).json({ message: 'Error fetching reports', error: err.message });
     }
 });
@@ -433,175 +484,22 @@ apiRouter.get('/suppliers', authenticateToken, async (req, res) => {
     catch(e) { res.status(500).json({message: e.message}) }
 });
 
-// --- <<<<<<<<<<<<<<< NUEVAS RUTAS DE PEDIDOS >>>>>>>>>>>>>>>> ---
-
-// --- PEDIDOS A PROVEEDORES (PURCHASE ORDERS) ---
+// --- Rutas de Pedidos (Purchase & Customer) ---
 const purchaseOrderRouter = express.Router();
 purchaseOrderRouter.use(authenticateToken);
-
-// GET all purchase orders
-purchaseOrderRouter.get('/', async (req, res) => {
-    try {
-        const query = `
-            SELECT po.*, s.name as supplier_name
-            FROM purchase_orders po
-            JOIN suppliers s ON po.supplier_id = s.id
-            ORDER BY po.order_date DESC
-        `;
-        const { rows } = await pool.query(query);
-        res.json(rows);
-    } catch (err) {
-        res.status(500).json({ message: 'Error fetching purchase orders', error: err.message });
-    }
-});
-
-// POST new purchase order
-purchaseOrderRouter.post('/', async (req, res) => {
-    const { supplier_id, expected_delivery_date, notes, items, total_cost } = req.body;
-    const client = await pool.connect();
-    try {
-        await client.query('BEGIN');
-        const poQuery = `
-            INSERT INTO purchase_orders (id, supplier_id, expected_delivery_date, notes, total_cost, status, created_by)
-            VALUES ($1, $2, $3, $4, $5, 'ordenado', $6) RETURNING *;
-        `;
-        const { rows: [newPO] } = await client.query(poQuery, [uuidv4(), supplier_id, expected_delivery_date, notes, total_cost, req.user.id]);
-        
-        for(const item of items) {
-            const poItemQuery = `
-                INSERT INTO purchase_order_items (purchase_order_id, product_id, quantity_ordered, cost_price_at_purchase)
-                VALUES ($1, $2, $3, $4);
-            `;
-            await client.query(poItemQuery, [newPO.id, item.product_id, item.quantity, item.cost_price]);
-        }
-        
-        await logAction(req.user.id, req.user.name, 'PURCHASE_ORDER_CREATE', `Creó orden de compra #${newPO.id.substring(0,8)} por $${total_cost}.`);
-        await client.query('COMMIT');
-        res.status(201).json(newPO);
-    } catch (err) {
-        await client.query('ROLLBACK');
-        res.status(500).json({ message: 'Error creating purchase order', error: err.message });
-    } finally {
-        client.release();
-    }
-});
-
-// PUT receive items for a purchase order
-purchaseOrderRouter.put('/:id/receive', async (req, res) => {
-    const { id: purchase_order_id } = req.params;
-    const { items_received } = req.body; // Array of { item_id, quantity_received }
-    const client = await pool.connect();
-    try {
-        await client.query('BEGIN');
-
-        for (const item of items_received) {
-            // Update quantity received in the order item
-            await client.query(
-                'UPDATE purchase_order_items SET quantity_received = quantity_received + $1 WHERE id = $2',
-                [item.quantity_received, item.item_id]
-            );
-
-            // Update product stock
-            const { rows: [poItem] } = await client.query('SELECT product_id FROM purchase_order_items WHERE id = $1', [item.item_id]);
-            await client.query(
-                'UPDATE products SET stock = stock + $1 WHERE id = $2',
-                [item.quantity_received, poItem.product_id]
-            );
-        }
-
-        // Check if the order is fully or partially received
-        const { rows: allItems } = await client.query('SELECT quantity_ordered, quantity_received FROM purchase_order_items WHERE purchase_order_id = $1', [purchase_order_id]);
-        const totalOrdered = allItems.reduce((sum, i) => sum + i.quantity_ordered, 0);
-        const totalReceived = allItems.reduce((sum, i) => sum + i.quantity_received, 0);
-
-        let newStatus = 'recibido_parcial';
-        if (totalReceived >= totalOrdered) {
-            newStatus = 'recibido_completo';
-        }
-
-        const { rows: [updatedPO] } = await client.query('UPDATE purchase_orders SET status = $1 WHERE id = $2 RETURNING *', [newStatus, purchase_order_id]);
-
-        await logAction(req.user.id, req.user.name, 'PURCHASE_ORDER_RECEIVE', `Recibió items para la orden de compra #${purchase_order_id.substring(0,8)}.`);
-        await client.query('COMMIT');
-        res.json(updatedPO);
-    } catch (err) {
-        await client.query('ROLLBACK');
-        res.status(500).json({ message: 'Error receiving purchase order items', error: err.message });
-    } finally {
-        client.release();
-    }
-});
-
+purchaseOrderRouter.get('/', async (req, res) => { try { const query = ` SELECT po.*, s.name as supplier_name FROM purchase_orders po JOIN suppliers s ON po.supplier_id = s.id ORDER BY po.order_date DESC `; const { rows } = await pool.query(query); res.json(rows); } catch (err) { res.status(500).json({ message: 'Error fetching purchase orders', error: err.message }); } });
+purchaseOrderRouter.post('/', async (req, res) => { const { supplier_id, expected_delivery_date, notes, items, total_cost } = req.body; const client = await pool.connect(); try { await client.query('BEGIN'); const poQuery = ` INSERT INTO purchase_orders (id, supplier_id, expected_delivery_date, notes, total_cost, status, created_by) VALUES ($1, $2, $3, $4, $5, 'ordenado', $6) RETURNING *; `; const { rows: [newPO] } = await client.query(poQuery, [uuidv4(), supplier_id, expected_delivery_date, notes, total_cost, req.user.id]); for(const item of items) { const poItemQuery = ` INSERT INTO purchase_order_items (purchase_order_id, product_id, quantity_ordered, cost_price_at_purchase) VALUES ($1, $2, $3, $4); `; await client.query(poItemQuery, [newPO.id, item.product_id, item.quantity, item.cost_price]); } await logAction(req.user.id, req.user.name, 'PURCHASE_ORDER_CREATE', `Creó orden de compra #${newPO.id.substring(0,8)} por $${total_cost}.`); await client.query('COMMIT'); res.status(201).json(newPO); } catch (err) { await client.query('ROLLBACK'); res.status(500).json({ message: 'Error creating purchase order', error: err.message }); } finally { client.release(); } });
+purchaseOrderRouter.put('/:id/receive', async (req, res) => { const { id: purchase_order_id } = req.params; const { items_received } = req.body; const client = await pool.connect(); try { await client.query('BEGIN'); for (const item of items_received) { await client.query( 'UPDATE purchase_order_items SET quantity_received = quantity_received + $1 WHERE id = $2', [item.quantity_received, item.item_id] ); const { rows: [poItem] } = await client.query('SELECT product_id FROM purchase_order_items WHERE id = $1', [item.item_id]); await client.query( 'UPDATE products SET stock = stock + $1 WHERE id = $2', [item.quantity_received, poItem.product_id] ); } const { rows: allItems } = await client.query('SELECT quantity_ordered, quantity_received FROM purchase_order_items WHERE purchase_order_id = $1', [purchase_order_id]); const totalOrdered = allItems.reduce((sum, i) => sum + i.quantity_ordered, 0); const totalReceived = allItems.reduce((sum, i) => sum + i.quantity_received, 0); let newStatus = 'recibido_parcial'; if (totalReceived >= totalOrdered) { newStatus = 'recibido_completo'; } const { rows: [updatedPO] } = await client.query('UPDATE purchase_orders SET status = $1 WHERE id = $2 RETURNING *', [newStatus, purchase_order_id]); await logAction(req.user.id, req.user.name, 'PURCHASE_ORDER_RECEIVE', `Recibió items para la orden de compra #${purchase_order_id.substring(0,8)}.`); await client.query('COMMIT'); res.json(updatedPO); } catch (err) { await client.query('ROLLBACK'); res.status(500).json({ message: 'Error receiving purchase order items', error: err.message }); } finally { client.release(); } });
 apiRouter.use('/purchase-orders', purchaseOrderRouter);
-
-
-// --- PEDIDOS DE CLIENTES (CUSTOMER ORDERS) ---
 const customerOrderRouter = express.Router();
 customerOrderRouter.use(authenticateToken);
-
-// GET all customer orders
-customerOrderRouter.get('/', async (req, res) => {
-    try {
-        const query = `SELECT * FROM customer_orders ORDER BY delivery_date ASC`;
-        const { rows } = await pool.query(query);
-        // Also fetch items for each order
-        const ordersWithItems = await Promise.all(rows.map(async (order) => {
-            const itemsResult = await pool.query('SELECT * FROM customer_order_items WHERE order_id = $1', [order.id]);
-            return { ...order, items: itemsResult.rows };
-        }));
-        res.json(ordersWithItems);
-    } catch (err) {
-        res.status(500).json({ message: 'Error fetching customer orders', error: err.message });
-    }
-});
-
-// POST new customer order
-customerOrderRouter.post('/', async (req, res) => {
-    const { customer_name, customer_phone, delivery_date, total_amount, down_payment, notes, items } = req.body;
-    const client = await pool.connect();
-    try {
-        await client.query('BEGIN');
-        const coQuery = `
-            INSERT INTO customer_orders (customer_name, customer_phone, delivery_date, total_amount, down_payment, notes, employee_id, status)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, 'pendiente') RETURNING *;
-        `;
-        const { rows: [newCO] } = await client.query(coQuery, [customer_name, customer_phone, delivery_date, total_amount, down_payment || 0, notes, req.user.id]);
-        
-        for(const item of items) {
-            const coItemQuery = `
-                INSERT INTO customer_order_items (order_id, description, quantity, unit_price)
-                VALUES ($1, $2, $3, $4);
-            `;
-            await client.query(coItemQuery, [newCO.id, item.description, item.quantity, item.unit_price]);
-        }
-        
-        await logAction(req.user.id, req.user.name, 'CUSTOMER_ORDER_CREATE', `Creó pedido para cliente '${customer_name}' por $${total_amount}.`);
-        await client.query('COMMIT');
-        res.status(201).json(newCO);
-    } catch (err) {
-        await client.query('ROLLBACK');
-        res.status(500).json({ message: 'Error creating customer order', error: err.message });
-    } finally {
-        client.release();
-    }
-});
-
-// PUT update customer order status
-customerOrderRouter.put('/:id/status', async (req, res) => {
-    const { id } = req.params;
-    const { status } = req.body;
-    try {
-        const { rows: [updatedOrder] } = await pool.query('UPDATE customer_orders SET status = $1 WHERE id = $2 RETURNING *', [status, id]);
-        await logAction(req.user.id, req.user.name, 'CUSTOMER_ORDER_UPDATE', `Actualizó estado del pedido #${id.substring(0,8)} a '${status}'.`);
-        res.json(updatedOrder);
-    } catch (err) {
-        res.status(500).json({ message: 'Error updating customer order status', error: err.message });
-    }
-});
-
+customerOrderRouter.get('/', async (req, res) => { try { const query = `SELECT * FROM customer_orders ORDER BY delivery_date ASC`; const { rows } = await pool.query(query); const ordersWithItems = await Promise.all(rows.map(async (order) => { const itemsResult = await pool.query('SELECT * FROM customer_order_items WHERE order_id = $1', [order.id]); return { ...order, items: itemsResult.rows }; })); res.json(ordersWithItems); } catch (err) { res.status(500).json({ message: 'Error fetching customer orders', error: err.message }); } });
+customerOrderRouter.post('/', async (req, res) => { const { customer_name, customer_phone, delivery_date, total_amount, down_payment, notes, items } = req.body; const client = await pool.connect(); try { await client.query('BEGIN'); const coQuery = ` INSERT INTO customer_orders (customer_name, customer_phone, delivery_date, total_amount, down_payment, notes, employee_id, status) VALUES ($1, $2, $3, $4, $5, $6, $7, 'pendiente') RETURNING *; `; const { rows: [newCO] } = await client.query(coQuery, [customer_name, customer_phone, delivery_date, total_amount, down_payment || 0, notes, req.user.id]); for(const item of items) { const coItemQuery = ` INSERT INTO customer_order_items (order_id, description, quantity, unit_price) VALUES ($1, $2, $3, $4); `; await client.query(coItemQuery, [newCO.id, item.description, item.quantity, item.unit_price]); } await logAction(req.user.id, req.user.name, 'CUSTOMER_ORDER_CREATE', `Creó pedido para cliente '${customer_name}' por $${total_amount}.`); await client.query('COMMIT'); res.status(201).json(newCO); } catch (err) { await client.query('ROLLBACK'); res.status(500).json({ message: 'Error creating customer order', error: err.message }); } finally { client.release(); } });
+customerOrderRouter.put('/:id/status', async (req, res) => { const { id } = req.params; const { status } = req.body; try { const { rows: [updatedOrder] } = await pool.query('UPDATE customer_orders SET status = $1 WHERE id = $2 RETURNING *', [status, id]); await logAction(req.user.id, req.user.name, 'CUSTOMER_ORDER_UPDATE', `Actualizó estado del pedido #${id.substring(0,8)} a '${status}'.`); res.json(updatedOrder); } catch (err) { res.status(500).json({ message: 'Error updating customer order status', error: err.message }); } });
 apiRouter.use('/customer-orders', customerOrderRouter);
 
 
+// Iniciar servidor
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`Backend server is running on http://localhost:${PORT}`);
 });
