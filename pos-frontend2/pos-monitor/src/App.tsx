@@ -1,8 +1,8 @@
-import React, { useState, useEffect, useCallback, ReactNode, createContext, useContext } from 'react';
-import { BarChart, Package, Users, Clipboard as ClipboardIcon, Calendar as CalendarIcon, LogOut, Search, AlertCircle, PlusCircle, Edit, X, ChevronUp, ChevronDown } from 'lucide-react';
+import React, { useState, useEffect, useCallback, ReactNode, createContext, useContext, useRef } from 'react';
+import { BarChart, Package, Users, Clipboard as ClipboardIcon, Calendar as CalendarIcon, LogOut, Search, AlertCircle, PlusCircle, Edit, X, DollarSign, TrendingUp, Receipt, Star, Clock, CreditCard } from 'lucide-react';
 
 // --- CONFIGURACIÓN DE LA API ---
-const API_BASE_URL = 'http://192.168.1.10:3001/api';
+const API_BASE_URL = 'http://192.168.1.8:3001/api';
 
 // --- DEFINICIONES DE TIPOS DE DATOS ---
 interface Product {
@@ -17,6 +17,12 @@ interface User {
 interface Employee {
     id: string; first_name: string; last_name: string; rut: string;
     role: 'admin' | 'cajero'; is_active: boolean; created_at: string;
+}
+
+interface CashSession {
+    id: string;
+    current_balance: number;
+    is_active: boolean;
 }
 
 interface SaleItem {
@@ -52,6 +58,21 @@ interface CustomerOrder {
 }
 
 type ReportFeedItem = Sale | ActionLog;
+
+interface SummaryData {
+    total_sales_today: number;
+    number_of_sales_today: number;
+    sales_by_payment_method: {
+        efectivo: number;
+        tarjeta: number;
+        'venta especial': number;
+    };
+    top_selling_product_today: {
+        name: string;
+        total_quantity: number;
+    };
+    pending_customer_orders: number;
+}
 
 // --- CONTEXTO PARA MODALES ---
 const AppContext = createContext<{
@@ -222,7 +243,7 @@ const PedidosView = () => {
     return (
         <div className="bg-white p-6 rounded-lg shadow-md">
             <h3 className="text-xl font-semibold mb-4">Pedidos de Clientes</h3>
-            <div className="space-y-4 max-h-[70vh] overflow-y-auto pr-2">
+            <div className="space-y-4">
                 {orders.length > 0 ? orders.map(order => (
                     <div key={order.id} className={`p-4 rounded-md border-l-4 ${statusColors[order.status] || 'bg-gray-100'}`}>
                         <div className="flex justify-between items-start">
@@ -232,7 +253,7 @@ const PedidosView = () => {
                                 <p className="text-sm text-gray-500">Tel: {order.customer_phone}</p>
                             </div>
                             <span className={`px-2 py-1 text-xs font-semibold rounded-full ${statusColors[order.status]}`}>
-                                {order.status.replace('_', ' ')}
+                                {order.status.replace(/_/g, ' ')}
                             </span>
                         </div>
                          <div className="mt-2 text-right">
@@ -355,7 +376,7 @@ const AuditoriaView = () => {
     return (
         <div className="bg-white p-6 rounded-lg shadow-md">
             <h3 className="text-xl font-semibold mb-4">Registro de Actividad</h3>
-            <div className="space-y-4 max-h-[70vh] overflow-y-auto pr-2">
+            <div className="space-y-4 max-h-[70vh] overflow-y-auto">
                 {data.map(item => (
                     <div key={item.id} className="p-4 rounded-md border">
                         {item.type === 'SALE' ? (
@@ -413,9 +434,9 @@ const UsuariosView = () => {
                  <h3 className="text-xl font-semibold">Gestión de Usuarios</h3>
                  <Button onClick={openCreateModal} className="bg-blue-600 text-white hover:bg-blue-700 flex items-center gap-2"><PlusCircle size={18}/>Crear Usuario</Button>
             </div>
-            <div className="max-h-[65vh] overflow-y-auto">
+            <div className="overflow-x-auto">
                 <table className="w-full text-sm text-left text-gray-500">
-                    <thead className="text-xs text-gray-700 uppercase bg-gray-50 sticky top-0">
+                    <thead className="text-xs text-gray-700 uppercase bg-gray-50">
                         <tr>
                             <th scope="col" className="px-6 py-3">Nombre</th><th scope="col" className="px-6 py-3">RUT</th>
                             <th scope="col" className="px-6 py-3">Rol</th><th scope="col" className="px-6 py-3 text-center">Estado</th>
@@ -440,15 +461,88 @@ const UsuariosView = () => {
     );
 };
 
-const CierresCajaView = () => (
-    <div className="bg-white p-6 rounded-lg shadow-md">
-        <h3 className="text-xl font-semibold mb-4">Consulta de Cierres de Caja</h3>
-        <div className="bg-yellow-100 border-l-4 border-yellow-500 text-yellow-700 p-4 rounded-md">
-            <p className="font-bold">Funcionalidad no disponible</p>
-            <p>El backend actual no proporciona un endpoint para consultar el historial de cierres de caja.</p>
+// --- VISTA DE REPORTES ---
+const StatCard = ({ title, value, icon, note }: { title: string; value: string; icon: ReactNode, note?: string }) => (
+    <div className="bg-white p-5 rounded-xl shadow-md flex flex-col justify-between transition-transform hover:scale-105">
+        <div>
+            <div className="flex items-center justify-between">
+                <p className="text-sm font-medium text-gray-500">{title}</p>
+                <div className="text-gray-400">{icon}</div>
+            </div>
+            <p className="text-3xl font-bold text-gray-800 mt-1">{value}</p>
         </div>
+        {note && <p className="text-xs text-gray-400 mt-3">{note}</p>}
     </div>
 );
+
+const ReportesView = () => {
+    const { showModal } = useAppContext();
+    const [summary, setSummary] = useState<SummaryData | null>(null);
+    const [isLoading, setIsLoading] = useState(true);
+    const [error, setError] = useState<string | null>(null);
+
+    useEffect(() => {
+        const fetchSummary = async () => {
+            try {
+                setIsLoading(true);
+                const data = await apiService.get('/reports/summary');
+                setSummary(data);
+                setError(null);
+            } catch (err: any) {
+                setError(err.message);
+                showModal("Error al Cargar Reportes", err.message, 'error');
+            } finally {
+                setIsLoading(false);
+            }
+        };
+        fetchSummary();
+    }, [showModal]);
+
+    if (isLoading) return <LoadingSpinner />;
+    if (error) return <ErrorDisplay message={error} />;
+    if (!summary) return <p>No se encontraron datos de resumen.</p>;
+
+    return (
+        <div>
+            <h3 className="text-2xl font-bold mb-6 text-gray-800">Resumen del Día</h3>
+            <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
+                <StatCard 
+                    title="Ventas Totales (Hoy)"
+                    value={`$${summary.total_sales_today.toLocaleString('es-CL')}`}
+                    icon={<TrendingUp size={24} />}
+                />
+                <StatCard 
+                    title="Transacciones (Hoy)"
+                    value={summary.number_of_sales_today.toString()}
+                    icon={<Receipt size={24} />}
+                />
+                <StatCard 
+                    title="Pedidos Pendientes"
+                    value={summary.pending_customer_orders.toString()}
+                    icon={<Clock size={24} />}
+                    note="Incluye 'pendientes' y 'en preparación'"
+                />
+                 <StatCard 
+                    title="Ventas en Efectivo"
+                    value={`$${summary.sales_by_payment_method.efectivo.toLocaleString('es-CL')}`}
+                    icon={<DollarSign size={24} />}
+                 />
+                 <StatCard 
+                    title="Ventas con Tarjeta"
+                    value={`$${(summary.sales_by_payment_method.tarjeta + summary.sales_by_payment_method['venta especial']).toLocaleString('es-CL')}`}
+                    icon={<CreditCard size={24} />}
+                 />
+                <StatCard 
+                    title="Producto Estrella (Hoy)"
+                    value={summary.top_selling_product_today.name}
+                    icon={<Star size={24} />}
+                    note={`Vendido ${summary.top_selling_product_today.total_quantity} veces`}
+                />
+            </div>
+        </div>
+    );
+};
+
 
 const LoginView: React.FC = () => {
     const { login } = useAuth();
@@ -482,14 +576,43 @@ const LoginView: React.FC = () => {
 const AdminPanel = () => {
   const { user } = useAuth();
   const [selectedMenu, setSelectedMenu] = useState('Pedidos');
-  const [isDropdownOpen, setDropdownOpen] = useState(true);
+  const [currentTime, setCurrentTime] = useState(new Date());
+  const [activeSession, setActiveSession] = useState<CashSession | null>(null);
+  const headerRef = useRef<HTMLElement>(null);
+  const [headerHeight, setHeaderHeight] = useState(0);
+
+   useEffect(() => {
+        const timer = setInterval(() => setCurrentTime(new Date()), 1000 * 60);
+        
+        const observer = new ResizeObserver(entries => {
+            for (let entry of entries) { setHeaderHeight(entry.target.clientHeight); }
+        });
+
+        if (headerRef.current) { observer.observe(headerRef.current); }
+
+        const fetchCashSession = async () => {
+            try {
+                const sessionData = await apiService.get('/cash-sessions/active');
+                setActiveSession(sessionData);
+            } catch (error) {
+                console.error("Failed to fetch active cash session:", error);
+            }
+        };
+
+        fetchCashSession();
+
+        return () => {
+            clearInterval(timer);
+            if (headerRef.current) { observer.unobserve(headerRef.current); }
+        };
+    }, []);
 
   let menuItems = [
     { name: 'Pedidos', icon: <CalendarIcon size={20} />, view: <PedidosView />, adminOnly: false },
     { name: 'Productos', icon: <Package size={20} />, view: <ProductosView />, adminOnly: false },
     { name: 'Auditoría', icon: <ClipboardIcon size={20} />, view: <AuditoriaView />, adminOnly: true },
     { name: 'Usuarios', icon: <Users size={20} />, view: <UsuariosView />, adminOnly: true },
-    { name: 'Cierres de caja', icon: <BarChart size={20} />, view: <CierresCajaView />, adminOnly: true },
+    { name: 'Reportes', icon: <BarChart size={20} />, view: <ReportesView />, adminOnly: true },
   ];
 
   if (user?.role !== 'admin') {
@@ -502,54 +625,69 @@ const AdminPanel = () => {
   };
 
   return (
-    <div className="flex h-screen bg-gray-50 font-sans">
-      <aside className="w-64 bg-gray-800 text-white flex-col hidden sm:flex">
-        <div className="p-5 text-2xl font-bold border-b border-gray-700">Panchita</div>
-        <nav className="flex-1 px-4 py-4">
-          <ul>
-            <li>
-              <button onClick={() => setDropdownOpen(!isDropdownOpen)} className="w-full flex justify-between items-center p-3 rounded-md text-left text-gray-300 hover:bg-gray-700 transition-colors">
-                <span className="font-semibold">Consultas</span>
-                {isDropdownOpen ? <ChevronUp size={20} /> : <ChevronDown size={20} />}
-              </button>
-              {isDropdownOpen && (
-                <ul className="pl-4 mt-2">
-                  {menuItems.map((item) => (
-                    <li key={item.name}>
-                      <a href="#" className={`flex items-center gap-3 p-3 my-1 rounded-md text-sm transition-colors ${selectedMenu === item.name ? 'bg-blue-600 text-white' : 'text-gray-300 hover:bg-gray-700'}`}
-                        onClick={(e) => { e.preventDefault(); setSelectedMenu(item.name); }}>
-                        {item.icon}<span>{item.name}</span>
-                      </a>
-                    </li>
-                  ))}
-                </ul>
-              )}
-            </li>
-          </ul>
-        </nav>
-        <div className="p-4 border-t border-gray-700"><LogoutButton/></div>
-      </aside>
+    <div className="flex flex-col h-screen bg-gray-100">
+        <header ref={headerRef} className="fixed top-0 left-0 right-0 bg-white shadow-md z-50">
+            {/* ========== INICIO DEL CÓDIGO MODIFICADO ========== */}
+            <div className="bg-gray-800 text-white px-4 py-3">
+                <div className="flex flex-wrap justify-between items-center gap-y-2">
+                    {/* Left Side: Title */}
+                    <div className="text-xl font-bold">
+                        Panchita
+                    </div>
 
-      <main className="flex-1 flex flex-col overflow-hidden">
-        <header className="bg-white shadow-sm p-4 flex justify-between items-center">
-            <h1 className="text-2xl font-semibold text-gray-800">{selectedMenu}</h1>
-            <div className="sm:hidden"><LogoutButton isMobile={true}/></div>
+                    {/* Right Side: User Info & Logout */}
+                    <div className="flex items-center gap-3">
+                        <div className="font-semibold text-sm whitespace-nowrap">{user?.name}</div>
+                        <LogoutButton />
+                    </div>
+
+                    {/* Full-width bottom row on mobile for cash status */}
+                    <div className="w-full sm:w-auto">
+                        {activeSession ? (
+                            <div className="flex items-center justify-center sm:justify-start bg-green-100 text-green-800 px-3 py-1 rounded-full font-semibold text-xs whitespace-nowrap">
+                                <span>Caja: ${activeSession.current_balance.toLocaleString('es-CL')}</span>
+                            </div>
+                        ) : (
+                            <div className="flex items-center justify-center sm:justify-start gap-1 bg-red-600 px-3 py-1 rounded-full text-xs font-semibold whitespace-nowrap">
+                                <DollarSign size={14}/>
+                                <span>Cerrada</span>
+                            </div>
+                        )}
+                    </div>
+                </div>
+            </div>
+            {/* ========== FIN DEL CÓDIGO MODIFICADO ========== */}
+            <nav className="bg-gray-50 border-b">
+                 <div className="flex flex-wrap items-center justify-center gap-2 p-2">
+                    {menuItems.map(item => (
+                        <button 
+                            key={item.name}
+                            onClick={() => setSelectedMenu(item.name)}
+                            className={`flex items-center gap-2 px-3 py-2 rounded-md text-sm font-medium transition-colors ${
+                                selectedMenu === item.name 
+                                ? 'bg-blue-600 text-white shadow-sm'
+                                : 'text-gray-600 hover:bg-gray-200'
+                            }`}
+                        >
+                            {item.icon}
+                            <span>{item.name}</span>
+                        </button>
+                    ))}
+                </div>
+            </nav>
         </header>
-        <div className="p-4 sm:p-8 overflow-y-auto">{renderContent()}</div>
-        <div className="sm:hidden grid grid-cols-4 gap-2 p-2 bg-gray-800 text-white border-t border-gray-700">
-             {menuItems.map(item => (<button key={item.name} onClick={() => setSelectedMenu(item.name)} className={`flex flex-col items-center justify-center p-2 rounded-md transition-colors text-xs ${selectedMenu === item.name ? 'bg-blue-600' : 'hover:bg-gray-700'}`}>{item.icon}<span className="mt-1">{item.name.split(' ')[0]}</span></button>))}
-        </div>
-      </main>
+        <main className="flex-1 overflow-y-auto" style={{ paddingTop: `${headerHeight}px` }}>
+            <div className="p-4 sm:p-6">
+                {renderContent()}
+            </div>
+        </main>
     </div>
   );
 };
 
-const LogoutButton = ({ isMobile = false }) => {
+const LogoutButton = () => {
     const { logout } = useAuth();
-    if(isMobile) {
-        return <button onClick={logout} className="p-2 rounded-md bg-red-500 hover:bg-red-600 text-white"><LogOut size={20}/></button>
-    }
-    return <button onClick={logout} className="w-full flex items-center justify-center gap-2 p-2 rounded-md bg-red-500 hover:bg-red-600 text-white transition-colors"><LogOut size={16}/> Salir</button>
+    return <button onClick={logout} className="p-2 rounded-full hover:bg-red-500 transition-colors"><LogOut size={20}/></button>
 }
 
 

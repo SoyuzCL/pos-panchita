@@ -1,5 +1,5 @@
 import React, { useState, useEffect, createContext, useContext, useCallback, ReactNode } from 'react';
-import { ShoppingCart, Package, BarChart3, RotateCcw, EyeOff, Eye, PlusCircle, Search, Trash2, Edit3, DollarSign, CalendarDays, Filter, X, Menu, Settings, MinusCircle, Plus, LogOut, Users, Building, UserCircle, UserPlus, ClipboardList, ChevronDown, ChevronUp, AlertCircle, CheckCircle, Briefcase, AlertTriangle, Archive, Star, Truck, ClipboardPlus } from 'lucide-react';
+import { ShoppingCart, Package, BarChart3, RotateCcw, EyeOff, Eye, PlusCircle, Search, Trash2, Edit3, DollarSign, CalendarDays, Filter, X, Menu, Settings, MinusCircle, Plus, LogOut, Users, Building, UserCircle, UserPlus, ClipboardList, ChevronDown, ChevronUp, AlertCircle, CheckCircle, Briefcase, AlertTriangle, Archive, Star, Truck, ClipboardPlus, FilePlus, ChevronRight, Eye as EyeIcon, ArrowLeft } from 'lucide-react';
 
 // --- CONFIGURACIÓN API ---
 const API_BASE_URL = 'http://localhost:3001/api';
@@ -40,7 +40,7 @@ const AppContext = createContext<{ showModal: (title: string, message: React.Rea
 export const useAppContext = () => { const context = useContext(AppContext); if (!context) throw new Error("useAppContext must be used within an AppProvider"); return context; };
 
 // --- Contexto de Autenticación ---
-const AuthContext = createContext<{ user: User | null; token: string | null; login: (token: string, user: User) => void; logout: () => void; isAdmin: boolean; canManageInventory: boolean; } | null>(null);
+const AuthContext = createContext<{ user: User | null; token: string | null; login: (token: string, user: User) => void; logout: () => Promise<void>; isAdmin: boolean; canManageInventory: boolean; canManageSuppliers: boolean;} | null>(null);
 export const useAuth = () => { const context = useContext(AuthContext); if (!context) throw new Error("useAuth must be used within an AuthProvider"); return context; };
 
 // --- Contexto de Caja ---
@@ -72,17 +72,25 @@ const AuthProvider = ({ children }: { children: ReactNode }) => {
         setUser(userData);
     };
     
-    const logout = () => {
-        sessionStorage.clear();
-        setToken(null);
-        setUser(null);
-        window.location.reload();
+    const logout = async () => {
+        try {
+            await apiService.post('/cash-sessions/close', {});
+        } catch (error) {
+            console.error("Failed to close cash session on server:", error);
+        } finally {
+            sessionStorage.clear();
+            setToken(null);
+            setUser(null);
+            window.location.reload();
+        }
     };
 
     const isAdmin = user?.role === 'admin';
     const canManageInventory = user?.role === 'admin' || user?.role === 'cajero';
+    const canManageSuppliers = user?.role === 'admin' || user?.role === 'cajero';
 
-    return <AuthContext.Provider value={{ user, token, login, logout, isAdmin, canManageInventory }}>{children}</AuthContext.Provider>;
+
+    return <AuthContext.Provider value={{ user, token, login, logout, isAdmin, canManageInventory, canManageSuppliers }}>{children}</AuthContext.Provider>;
 };
 
 const CashSessionProvider = ({ children }: { children: ReactNode }) => {
@@ -152,13 +160,9 @@ const Select: React.FC<React.SelectHTMLAttributes<HTMLSelectElement> & { label?:
         <select id={id} className={`block w-full px-3 py-2 border border-gray-300 bg-white rounded-md shadow-sm focus:outline-none focus:ring-blue-500 focus:border-blue-500 sm:text-sm ${className || ''}`} {...props}>{children}</select>
     </div>
 );
-const Modal: React.FC<{ isOpen: boolean; onClose?: () => void; title: string; children: ReactNode; footer?: ReactNode; size?: 'lg'|'xl'|'2xl' }> = ({ isOpen, onClose, title, children, footer, size = 'lg' }) => {
+const Modal: React.FC<{ isOpen: boolean; onClose?: () => void; title: string; children: ReactNode; footer?: ReactNode; size?: 'lg'|'xl'|'2xl'|'3xl'|'4xl' }> = ({ isOpen, onClose, title, children, footer, size = 'lg' }) => {
     if (!isOpen) return null;
-    const sizeClasses = {
-        'lg': 'max-w-lg',
-        'xl': 'max-w-xl',
-        '2xl': 'max-w-2xl',
-    }
+    const sizeClasses = { 'lg': 'max-w-lg', 'xl': 'max-w-xl', '2xl': 'max-w-2xl', '3xl': 'max-w-3xl', '4xl': 'max-w-4xl' }
     return (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black bg-opacity-60" aria-labelledby="modal-title" role="dialog" aria-modal="true">
             <div className={`bg-white rounded-lg shadow-xl w-full m-4 ${sizeClasses[size]}`}>
@@ -191,7 +195,6 @@ const apiService = {
         const errorData = await response.json().catch(() => ({ message: response.statusText }));
         throw new Error(errorData.message || `Error ${response.status}: ${response.statusText}`);
     }
-    // Para la ruta de impresión, podemos recibir un 202 que no es un error
     if (response.status === 202) {
         return response.json();
     }
@@ -341,7 +344,6 @@ const SalesView: React.FC = () => {
         setIsPaymentModalOpen(true);
     };
 
-    // --- MODIFICADO: Función para procesar la venta y la impresión ---
     const executeSale = async (paymentMethod: 'efectivo' | 'tarjeta' | 'venta especial', details?: { amountPaid?: number; adminRut?: string; adminPassword?: string }) => {
         setIsProcessingSale(true);
         const salePayload: any = {
@@ -358,22 +360,18 @@ const SalesView: React.FC = () => {
         try {
             await apiService.post('/sales', salePayload);
 
-            // --- INICIO DE MODIFICACIÓN: Impresión y apertura de caja ---
-            // Solo imprimir para ventas con efectivo o tarjeta
             if (paymentMethod === 'efectivo' || paymentMethod === 'tarjeta') {
                  const amountPaid = details?.amountPaid || totalAmount;
                  const change = amountPaid - totalAmount;
                  const receiptData = {
-                    items: cart, // Enviar el carrito completo con todos los datos
+                    items: cart,
                     total_amount: totalAmount,
                     payment_method: paymentMethod,
                     amountPaid: amountPaid,
                     change: change
                  };
-                 // Llamada a la API de impresión sin esperar (fire-and-forget)
                  apiService.post('/print-receipt', receiptData)
                     .then((printResponse: any) => {
-                        // Si la impresora no estaba conectada (202), mostrar un aviso no bloqueante.
                         if (printResponse && printResponse.message && printResponse.message.includes("no se pudo conectar")) {
                             showModal("Aviso de Impresión", printResponse.message, 'info');
                         }
@@ -383,7 +381,6 @@ const SalesView: React.FC = () => {
                         showModal("Error de Impresión", "La venta se guardó, pero hubo un error al enviar el recibo a imprimir.", 'error');
                     });
             }
-            // --- FIN DE MODIFICACIÓN ---
 
             if (paymentMethod === 'efectivo' && session && setSession && details?.amountPaid) {
                 const newBalance = session.current_balance + totalAmount;
@@ -416,7 +413,6 @@ const SalesView: React.FC = () => {
         }
     };
     
-    // --- NUEVO: Manejador para el lector de código de barras ---
     const handleSearchKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
         if (e.key === 'Enter') {
             e.preventDefault(); 
@@ -446,7 +442,6 @@ const SalesView: React.FC = () => {
             onProcessSale={executeSale}
         />
         <div className="flex flex-col lg:flex-row gap-4 p-4 h-full overflow-hidden bg-gray-100">
-            {/* --- MODIFICADO: Se añade onKeyDown al Input --- */}
             <div className="lg:w-3/5 flex flex-col bg-gray-200 p-4 rounded-lg shadow">
                 <Input 
                     type="text" 
@@ -943,7 +938,7 @@ const ReportsView: React.FC = () => {
 
 const SuppliersView: React.FC = () => {
     const { showModal } = useAppContext();
-    const { isAdmin } = useAuth();
+    const { canManageSuppliers } = useAuth();
     const [suppliers, setSuppliers] = useState<Supplier[]>([]);
     const [isLoading, setIsLoading] = useState(true);
     const [selectedSupplier, setSelectedSupplier] = useState<Supplier | null>(null);
@@ -959,20 +954,41 @@ const SuppliersView: React.FC = () => {
         <div className="flex flex-col lg:flex-row gap-4 p-4 h-full overflow-hidden bg-gray-100">
            <div className="lg:w-3/5 flex flex-col bg-white p-4 rounded-lg shadow">
                 <h3 className="text-lg font-bold mb-3">Lista de Proveedores</h3>
-                <div className="overflow-y-auto flex-grow">{isLoading ? <p>Cargando...</p> : <table className="w-full text-sm"><thead><tr className="text-left font-semibold border-b"><th className="p-2">Nombre</th><th className="p-2">RUT</th><th className="p-2">Contacto</th></tr></thead><tbody>{suppliers.map(s=>(<tr key={s.id} onClick={()=>selectSupplier(s)} className="cursor-pointer hover:bg-gray-50 border-b"><td className="p-2">{s.name}</td><td className="p-2">{s.rut}</td><td className="p-2">{s.contact_person}</td></tr>))}</tbody></table>}</div>
+                <div className="overflow-y-auto flex-grow">{isLoading ? <p>Cargando...</p> : 
+                <table className="w-full text-sm">
+                    <thead className="bg-gray-50">
+                        <tr className="text-left font-semibold border-b">
+                            <th className="p-2">Nombre</th>
+                            <th className="p-2">Contacto</th>
+                            <th className="p-2">Teléfono</th>
+                            <th className="p-2">Email</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {suppliers.map(s=>(
+                            <tr key={s.id} onClick={()=>selectSupplier(s)} className="cursor-pointer hover:bg-gray-50 border-b">
+                                <td className="p-2 font-medium">{s.name}</td>
+                                <td className="p-2">{s.contact_person}</td>
+                                <td className="p-2">{s.phone}</td>
+                                <td className="p-2">{s.email}</td>
+                            </tr>
+                        ))}
+                    </tbody>
+                </table>
+                }</div>
            </div>
            <div className="lg:w-2/5 bg-white p-4 rounded-lg shadow">
                 <h3 className="text-lg font-bold mb-3">{selectedSupplier ? 'Editar' : 'Nuevo'} Proveedor</h3>
                 <form onSubmit={handleSubmit} className="space-y-3">
-                    <Input label="Nombre" name="name" value={form.name || ''} onChange={handleInputChange} required disabled={!isAdmin}/>
-                    <Input label="RUT" name="rut" value={form.rut || ''} onChange={handleInputChange} disabled={!isAdmin}/>
-                    <Input label="Contacto" name="contact_person" value={form.contact_person || ''} onChange={handleInputChange} disabled={!isAdmin}/>
-                    <Input label="Teléfono" name="phone" value={form.phone || ''} onChange={handleInputChange} disabled={!isAdmin}/>
-                    <Input label="Email" name="email" value={form.email || ''} type="email" onChange={handleInputChange} disabled={!isAdmin}/>
-                    <Input label="Dirección" name="address" value={form.address || ''} onChange={handleInputChange} disabled={!isAdmin}/>
+                    <Input label="Nombre" name="name" value={form.name || ''} onChange={handleInputChange} required disabled={!canManageSuppliers}/>
+                    <Input label="RUT" name="rut" value={form.rut || ''} onChange={handleInputChange} disabled={!canManageSuppliers}/>
+                    <Input label="Contacto" name="contact_person" value={form.contact_person || ''} onChange={handleInputChange} disabled={!canManageSuppliers}/>
+                    <Input label="Teléfono" name="phone" value={form.phone || ''} onChange={handleInputChange} disabled={!canManageSuppliers}/>
+                    <Input label="Email" name="email" value={form.email || ''} type="email" onChange={handleInputChange} disabled={!canManageSuppliers}/>
+                    <Input label="Dirección" name="address" value={form.address || ''} onChange={handleInputChange} disabled={!canManageSuppliers}/>
                     <div className="flex gap-3 pt-2">
-                        <Button type="submit" disabled={!isAdmin} className="flex-1 bg-green-600 hover:bg-green-700 text-white">{selectedSupplier ? 'Guardar' : 'Crear'}</Button>
-                        {selectedSupplier && <Button type="button" onClick={handleDelete} variant="danger" disabled={!isAdmin}>Eliminar</Button>}
+                        <Button type="submit" disabled={!canManageSuppliers} className="flex-1 bg-green-600 hover:bg-green-700 text-white">{selectedSupplier ? 'Guardar' : 'Crear'}</Button>
+                        {selectedSupplier && <Button type="button" onClick={handleDelete} variant="danger" disabled={!canManageSuppliers}>Eliminar</Button>}
                     </div>
                     {selectedSupplier && <Button type="button" variant="secondary" onClick={clearForm} className="w-full mt-2">Cancelar</Button>}
                 </form>
@@ -1008,12 +1024,323 @@ const OrdersView: React.FC = () => {
 }
 
 const CustomerOrdersView: React.FC = () => {
-    return <div className="text-center p-10">Gestión de Pedidos de Clientes - Próximamente...</div>
+    return <div className="text-center p-10 bg-white rounded-lg shadow">Gestión de Pedidos de Clientes - Próximamente...</div>
 }
 
-const PurchaseOrdersView: React.FC = () => {
-    return <div className="text-center p-10">Gestión de Pedidos a Proveedores - Próximamente...</div>
+
+// =================================================================
+// INICIO: NUEVOS COMPONENTES PARA ÓRDENES DE COMPRA
+// =================================================================
+const CreatePurchaseOrderModal: React.FC<{
+    isOpen: boolean;
+    onClose: () => void;
+    onOrderCreated: () => void;
+    suppliers: Supplier[];
+    products: Product[];
+}> = ({ isOpen, onClose, onOrderCreated, suppliers, products }) => {
+    const { showModal } = useAppContext();
+    const [step, setStep] = useState(1);
+    const [selectedSupplierId, setSelectedSupplierId] = useState<string>('');
+    const [items, setItems] = useState<Array<Omit<PurchaseOrderItem, 'id' | 'purchase_order_id' | 'quantity_received'> & { product_name: string }>>([]);
+    const [notes, setNotes] = useState('');
+    const [expectedDeliveryDate, setExpectedDeliveryDate] = useState('');
+
+    const resetForm = () => {
+        setStep(1);
+        setSelectedSupplierId('');
+        setItems([]);
+        setNotes('');
+        setExpectedDeliveryDate('');
+    }
+
+    const handleClose = () => {
+        resetForm();
+        onClose();
+    }
+    
+    const handleAddItem = (product: Product, quantity: number) => {
+        if (quantity <= 0) return;
+        setItems(prev => {
+            const existingIndex = prev.findIndex(i => i.product_id === product.id);
+            if(existingIndex > -1) {
+                const newItems = [...prev];
+                newItems[existingIndex].quantity_ordered += quantity;
+                return newItems;
+            } else {
+                return [...prev, {
+                    product_id: product.id,
+                    product_name: product.name,
+                    quantity_ordered: quantity,
+                    cost_price_at_purchase: product.cost_price || 0
+                }];
+            }
+        });
+    }
+
+    const handleUpdateItemQuantity = (productId: string, newQuantity: number) => {
+        if(newQuantity <= 0) {
+            setItems(prev => prev.filter(i => i.product_id !== productId));
+        } else {
+            setItems(prev => prev.map(i => i.product_id === productId ? {...i, quantity_ordered: newQuantity} : i));
+        }
+    }
+
+    const totalCost = items.reduce((sum, item) => sum + (item.cost_price_at_purchase * item.quantity_ordered), 0);
+
+    const handleSubmit = async () => {
+        if(items.length === 0) {
+            showModal('Error', 'Debe agregar al menos un producto a la orden.', 'error');
+            return;
+        }
+
+        const payload = {
+            supplier_id: selectedSupplierId,
+            items: items.map(({ product_id, quantity_ordered, cost_price_at_purchase }) => ({ product_id, quantity: quantity_ordered, cost_price: cost_price_at_purchase })),
+            total_cost: totalCost,
+            notes,
+            expected_delivery_date: expectedDeliveryDate || null,
+        }
+
+        try {
+            await apiService.post('/purchase-orders', payload);
+            showModal('Éxito', 'Orden de compra creada correctamente.', 'success');
+            onOrderCreated();
+            handleClose();
+        } catch (error: any) {
+            showModal('Error', `No se pudo crear la orden: ${error.message}`, 'error');
+        }
+    }
+
+    const availableProducts = products.filter(p => !selectedSupplierId || p.supplier_id === selectedSupplierId);
+
+    return (
+        <Modal isOpen={isOpen} onClose={handleClose} title="Crear Orden de Compra" size="4xl"
+            footer={
+                <div className="w-full flex justify-between">
+                    {step === 2 && <Button variant="secondary" onClick={() => setStep(1)}><Icon icon={ArrowLeft} /> Volver</Button>}
+                    <div className="flex gap-3 ml-auto">
+                        <Button variant="secondary" onClick={handleClose}>Cancelar</Button>
+                        {step === 1 && <Button onClick={() => setStep(2)} disabled={!selectedSupplierId || items.length === 0}>Siguiente <Icon icon={ChevronRight} /></Button>}
+                        {step === 2 && <Button onClick={handleSubmit}>Enviar Orden</Button>}
+                    </div>
+                </div>
+            }
+        >
+            {step === 1 && (
+                <div className="grid grid-cols-2 gap-6">
+                    {/* Columna Izquierda: Selección de productos */}
+                    <div>
+                        <h4 className="font-bold text-lg mb-2">Paso 1: Agregar Productos</h4>
+                        <Select label="Seleccionar Proveedor" value={selectedSupplierId} onChange={e => setSelectedSupplierId(e.target.value)}>
+                            <option value="">Seleccione un proveedor...</option>
+                            {suppliers.map(s => <option key={s.id} value={s.id}>{s.name}</option>)}
+                        </Select>
+
+                        {selectedSupplierId && (
+                            <div className="mt-4 border-t pt-4">
+                                <h5 className="font-semibold mb-2">Productos Disponibles</h5>
+                                <div className="space-y-2 max-h-80 overflow-y-auto pr-2">
+                                    {availableProducts.map(p => (
+                                        <div key={p.id} className="bg-gray-50 p-2 rounded-md flex justify-between items-center">
+                                            <div>
+                                                <p className="font-medium text-sm">{p.name}</p>
+                                                <p className="text-xs text-gray-500">Costo: ${p.cost_price?.toFixed(2)}</p>
+                                            </div>
+                                            <Button size="sm" onClick={() => handleAddItem(p, 1)}>Agregar</Button>
+                                        </div>
+                                    ))}
+                                </div>
+                            </div>
+                        )}
+                    </div>
+
+                    {/* Columna Derecha: Resumen de la orden */}
+                    <div className="bg-gray-100 p-4 rounded-lg">
+                        <h4 className="font-bold text-lg mb-2">Resumen de Orden</h4>
+                        <div className="space-y-2 max-h-96 overflow-y-auto pr-2">
+                            {items.length === 0 ? <p className="text-sm text-gray-500">Aún no hay productos.</p> :
+                                items.map(item => (
+                                    <div key={item.product_id} className="bg-white p-2 rounded-md flex justify-between items-center">
+                                        <div>
+                                            <p className="font-medium text-sm">{item.product_name}</p>
+                                            <p className="text-xs text-gray-500">Costo: ${item.cost_price_at_purchase.toFixed(2)}</p>
+                                        </div>
+                                        <div className="flex items-center gap-2">
+                                            <Input type="number" value={item.quantity_ordered} onChange={(e) => handleUpdateItemQuantity(item.product_id, parseInt(e.target.value))} className="w-16 text-center" />
+                                            <Button variant="ghost" size="sm" onClick={() => handleUpdateItemQuantity(item.product_id, 0)}><Icon icon={Trash2} className="text-red-500"/></Button>
+                                        </div>
+                                    </div>
+                                ))
+                            }
+                        </div>
+                        <div className="mt-4 border-t pt-3 font-bold text-right">
+                            Total: ${totalCost.toFixed(2)}
+                        </div>
+                    </div>
+                </div>
+            )}
+            {step === 2 && (
+                <div>
+                    <h4 className="font-bold text-lg mb-2">Paso 2: Confirmar y Enviar</h4>
+                     <div className="grid grid-cols-2 gap-4 mb-4">
+                        <Input label="Fecha de Entrega Estimada (Opcional)" type="date" value={expectedDeliveryDate} onChange={e => setExpectedDeliveryDate(e.target.value)} />
+                        <Input label="Notas (Opcional)" value={notes} onChange={e => setNotes(e.target.value)} />
+                     </div>
+                    <div className="bg-gray-100 p-4 rounded-lg">
+                        <h5 className="font-bold mb-2">Resumen Final</h5>
+                        <table className="w-full text-sm">
+                            <thead><tr className="border-b"><th className="text-left p-2">Producto</th><th className="text-center p-2">Cantidad</th><th className="text-right p-2">Subtotal</th></tr></thead>
+                            <tbody>
+                                {items.map(item => (
+                                    <tr key={item.product_id}>
+                                        <td className="p-2">{item.product_name}</td>
+                                        <td className="p-2 text-center">{item.quantity_ordered}</td>
+                                        <td className="p-2 text-right">${(item.quantity_ordered * item.cost_price_at_purchase).toFixed(2)}</td>
+                                    </tr>
+                                ))}
+                            </tbody>
+                            <tfoot><tr className="border-t font-bold"><td colSpan={2} className="p-2 text-right">Total:</td><td className="p-2 text-right">${totalCost.toFixed(2)}</td></tr></tfoot>
+                        </table>
+                    </div>
+                </div>
+            )}
+        </Modal>
+    );
 }
+
+const PurchaseOrderDetailModal: React.FC<{
+    isOpen: boolean;
+    onClose: () => void;
+    order: PurchaseOrder | null;
+    onOrderUpdated: () => void;
+}> = ({ isOpen, onClose, order, onOrderUpdated }) => {
+    // Implementación del modal de detalle y recepción aquí
+    return (
+        <Modal isOpen={isOpen} onClose={onClose} title={`Detalle Orden #${order?.id.substring(0,8)}`} size="3xl">
+            <p>Detalles y recepción de la orden...</p>
+        </Modal>
+    )
+}
+
+
+const PurchaseOrdersView: React.FC = () => {
+    const { showModal } = useAppContext();
+    const [orders, setOrders] = useState<PurchaseOrder[]>([]);
+    const [suppliers, setSuppliers] = useState<Supplier[]>([]);
+    const [products, setProducts] = useState<Product[]>([]);
+    const [isLoading, setIsLoading] = useState(true);
+    const [isCreateModalOpen, setIsCreateModalOpen] = useState(false);
+    const [isDetailModalOpen, setIsDetailModalOpen] = useState(false);
+    const [selectedOrder, setSelectedOrder] = useState<PurchaseOrder | null>(null);
+
+    const fetchData = useCallback(async () => {
+        setIsLoading(true);
+        try {
+            const [ordersData, suppliersData, productsData] = await Promise.all([
+                apiService.get('/purchase-orders'),
+                apiService.get('/suppliers'),
+                apiService.get('/products?include_inactive=true')
+            ]);
+            setOrders(ordersData);
+            setSuppliers(suppliersData);
+            setProducts(productsData);
+        } catch (error: any) {
+            showModal('Error', `No se pudieron cargar los datos necesarios: ${error.message}`, 'error');
+        } finally {
+            setIsLoading(false);
+        }
+    }, [showModal]);
+
+    useEffect(() => {
+        fetchData();
+    }, [fetchData]);
+
+    const handleOpenDetailModal = (order: PurchaseOrder) => {
+        setSelectedOrder(order);
+        setIsDetailModalOpen(true);
+    }
+    
+    const StatusBadge: React.FC<{ status: PurchaseOrderStatus }> = ({ status }) => {
+        const styles = {
+            ordenado: 'bg-blue-100 text-blue-800',
+            recibido_parcial: 'bg-yellow-100 text-yellow-800',
+            recibido_completo: 'bg-green-100 text-green-800',
+            cancelado: 'bg-red-100 text-red-800',
+            pendiente: 'bg-gray-100 text-gray-800'
+        };
+        const text = {
+            ordenado: 'Ordenado',
+            recibido_parcial: 'Recibido Parcial',
+            recibido_completo: 'Recibido Completo',
+            cancelado: 'Cancelado',
+            pendiente: 'Pendiente'
+        }
+        return <span className={`px-2 py-1 text-xs font-medium rounded-full ${styles[status]}`}>{text[status]}</span>
+    }
+
+    return (
+        <>
+        <CreatePurchaseOrderModal 
+            isOpen={isCreateModalOpen} 
+            onClose={() => setIsCreateModalOpen(false)}
+            onOrderCreated={fetchData}
+            suppliers={suppliers}
+            products={products}
+        />
+        <PurchaseOrderDetailModal 
+            isOpen={isDetailModalOpen}
+            onClose={() => setIsDetailModalOpen(false)}
+            order={selectedOrder}
+            onOrderUpdated={fetchData}
+        />
+
+        <div className="h-full flex flex-col bg-white p-4 rounded-lg shadow">
+            <div className="flex justify-between items-center mb-4">
+                <h3 className="text-xl font-bold text-gray-800">Órdenes de Compra a Proveedores</h3>
+                <Button onClick={() => setIsCreateModalOpen(true)}>
+                    <Icon icon={FilePlus} /> Crear Nueva Orden
+                </Button>
+            </div>
+            <div className="flex-grow overflow-y-auto">
+                {isLoading ? <p>Cargando órdenes...</p> : (
+                    <table className="w-full text-sm text-left">
+                        <thead className="text-xs text-gray-700 uppercase bg-gray-50">
+                            <tr>
+                                <th className="p-3">Proveedor</th>
+                                <th className="p-3">Fecha de Orden</th>
+                                <th className="p-3">Entrega Estimada</th>
+                                <th className="p-3 text-right">Costo Total</th>
+                                <th className="p-3 text-center">Estado</th>
+                                <th className="p-3 text-center">Acciones</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            {orders.map(order => (
+                                <tr key={order.id} className="border-b hover:bg-gray-50">
+                                    <td className="p-3 font-medium">{order.supplier_name}</td>
+                                    <td className="p-3">{new Date(order.order_date).toLocaleDateString('es-CL')}</td>
+                                    <td className="p-3">{order.expected_delivery_date ? new Date(order.expected_delivery_date).toLocaleDateString('es-CL', { timeZone: 'UTC' }) : 'N/A'}</td>
+                                    <td className="p-3 text-right">${parseFloat(order.total_cost as any).toFixed(2)}</td>
+                                    <td className="p-3 text-center"><StatusBadge status={order.status} /></td>
+                                    <td className="p-3 text-center">
+                                        <Button variant="ghost" size="sm" onClick={() => handleOpenDetailModal(order)}>
+                                            <Icon icon={EyeIcon} /> Ver Detalles
+                                        </Button>
+                                    </td>
+                                </tr>
+                            ))}
+                        </tbody>
+                    </table>
+                )}
+            </div>
+        </div>
+        </>
+    );
+}
+// =================================================================
+// FIN: NUEVOS COMPONENTES
+// =================================================================
+
 
 const RegisterView: React.FC<{ onSwitchToLogin: () => void }> = ({ onSwitchToLogin }) => {
     const { showModal } = useAppContext();
@@ -1025,8 +1352,8 @@ const RegisterView: React.FC<{ onSwitchToLogin: () => void }> = ({ onSwitchToLog
         if (!formData.first_name || !formData.rut || !formData.password) { showModal("Campos Incompletos", "Nombre, RUT y contraseña son obligatorios.", "info"); return; }
         setIsLoading(true);
         try {
-            await apiService.post('/register', formData);
-            showModal("Registro Exitoso", "Tu cuenta ha sido creada. Ahora puedes iniciar sesión.", "success", onSwitchToLogin);
+            await apiService.post('/employees', formData);
+            showModal("Registro Exitoso", "La cuenta ha sido creada. Ahora puedes iniciar sesión.", "success", onSwitchToLogin);
         } catch (error: any) {
             showModal("Error de Registro", error.message, "error");
         } finally {
@@ -1195,7 +1522,7 @@ const CashMovementModal: React.FC<{isOpen: boolean, onClose: () => void}> = ({ i
 type Page = 'sales' | 'inventory' | 'reports' | 'suppliers' | 'orders';
 
 const MainApp: React.FC = () => {
-  const { user, logout, isAdmin } = useAuth();
+  const { user, logout, canManageSuppliers } = useAuth();
   const { session } = useCashSession();
   const [currentPage, setCurrentPage] = useState<Page>('sales'); 
   const [currentTime, setCurrentTime] = useState(new Date()); 
@@ -1209,7 +1536,7 @@ const MainApp: React.FC = () => {
         case 'inventory': return <InventoryView />;
         case 'reports': return <ReportsView />;
         case 'orders': return <OrdersView />;
-        case 'suppliers': return isAdmin ? <SuppliersView /> : <div className="p-4">Acceso denegado.</div>;
+        case 'suppliers': return canManageSuppliers ? <SuppliersView /> : <div className="p-4">Acceso denegado.</div>;
         default: return <SalesView />;
     }
   };
@@ -1239,24 +1566,18 @@ const MainApp: React.FC = () => {
             </div>
         </header>
 
-        <nav className="bg-white px-4 border-b border-gray-200 flex justify-center items-center relative">
+        <nav className="bg-white px-4 border-b border-gray-200 flex justify-center items-center">
             <div className="flex items-center">
                 <NavButton page="sales" label="Venta" icon={ShoppingCart} current={currentPage} onClick={setCurrentPage} />
                 <NavButton page="inventory" label="Inventario" icon={Package} current={currentPage} onClick={setCurrentPage} />
                 <NavButton page="orders" label="Pedidos" icon={ClipboardList} current={currentPage} onClick={setCurrentPage} />
                 <NavButton page="reports" label="Reportes" icon={BarChart3} current={currentPage} onClick={setCurrentPage} />
+                {canManageSuppliers && (
+                    <NavButton page="suppliers" label="Proveedores" icon={Building} current={currentPage} onClick={setCurrentPage} />
+                )}
             </div>
-            {isAdmin && (
-                <div className="absolute right-4 inset-y-0 flex items-center">
-                    <div className="relative group">
-                        <button className="px-4 py-3 text-sm font-medium text-gray-500 hover:text-gray-700 flex items-center gap-1"><Icon icon={Settings} /> Gestión</button>
-                        <div className="absolute right-0 mt-1 w-48 bg-white rounded-md shadow-lg py-1 z-20 hidden group-hover:block">
-                            <a href="#" onClick={(e) => { e.preventDefault(); setCurrentPage('suppliers')}} className="flex items-center gap-2 px-4 py-2 text-sm text-gray-700 hover:bg-gray-100"><Icon icon={Building}/> Proveedores</a>
-                        </div>
-                    </div>
-                </div>
-            )}
         </nav>
+
         <main className="flex-1 overflow-hidden">{renderPage()}</main>
         </div>
     </>
