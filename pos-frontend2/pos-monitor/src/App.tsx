@@ -2,7 +2,7 @@ import React, { useState, useEffect, useCallback, ReactNode, createContext, useC
 import { BarChart, Package, Users, Clipboard as ClipboardIcon, Calendar as CalendarIcon, LogOut, Search, AlertCircle, PlusCircle, Edit, X, DollarSign, TrendingUp, Receipt, Star, Clock, CreditCard } from 'lucide-react';
 
 // --- CONFIGURACIÓN DE LA API ---
-const API_BASE_URL = 'http://192.168.1.5:3001/api';
+const API_BASE_URL = 'http://192.168.1.4:3001/api';
 
 // --- DEFINICIONES DE TIPOS DE DATOS ---
 interface Product {

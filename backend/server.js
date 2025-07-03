@@ -14,7 +14,7 @@ const PORT = process.env.PORT || 3001;
 const allowedOrigins = [
   'http://localhost:5173',
   'http://localhost:5174',
-  'http://192.168.1.5:5173',
+  'http://192.168.1.4:5173',
   'http://172.20.10.6:5173'
 ];
 const corsOptions = {
@@ -325,6 +325,22 @@ apiRouter.get('/products/expiring-soon', authenticateToken, async (req, res) => 
     catch (err) { res.status(500).json({ message: 'Error fetching expiring products', error: err.message }); }
 });
 
+apiRouter.get('/products/on-order', authenticateToken, async (req, res) => {
+    try {
+        const query = `
+            SELECT DISTINCT poi.product_id
+            FROM purchase_order_items poi
+            JOIN purchase_orders po ON poi.purchase_order_id = po.id
+            WHERE po.status IN ('ordenado', 'recibido_parcial');
+        `;
+        const { rows } = await pool.query(query);
+        // Devolvemos un array plano de IDs: ['uuid1', 'uuid2', ...]
+        res.json(rows.map(r => r.product_id));
+    } catch (err) {
+        res.status(500).json({ message: 'Error fetching on-order products', error: err.message });
+    }
+});
+
 apiRouter.get('/products', authenticateToken, async (req, res) => {
     const { include_inactive } = req.query;
     let query = `SELECT p.*, s.name as supplier_name FROM products p LEFT JOIN suppliers s ON p.supplier_id = s.id`;
@@ -387,7 +403,104 @@ apiRouter.get('/sales', authenticateToken, async (req, res) => {
 const purchaseOrderRouter = express.Router(); purchaseOrderRouter.use(authenticateToken);
 purchaseOrderRouter.get('/', async (req, res) => { try { const query = ` SELECT po.*, s.name as supplier_name FROM purchase_orders po JOIN suppliers s ON po.supplier_id = s.id ORDER BY po.order_date DESC `; const { rows } = await pool.query(query); res.json(rows); } catch (err) { res.status(500).json({ message: 'Error fetching purchase orders', error: err.message }); } });
 purchaseOrderRouter.post('/', async (req, res) => { const { supplier_id, expected_delivery_date, notes, items, total_cost } = req.body; const client = await pool.connect(); try { await client.query('BEGIN'); const poQuery = ` INSERT INTO purchase_orders (id, supplier_id, expected_delivery_date, notes, total_cost, status, created_by) VALUES ($1, $2, $3, $4, $5, 'ordenado', $6) RETURNING *; `; const { rows: [newPO] } = await client.query(poQuery, [uuidv4(), supplier_id, expected_delivery_date, notes, total_cost, req.user.id]); for(const item of items) { const poItemQuery = ` INSERT INTO purchase_order_items (purchase_order_id, product_id, quantity_ordered, cost_price_at_purchase) VALUES ($1, $2, $3, $4); `; await client.query(poItemQuery, [newPO.id, item.product_id, item.quantity, item.cost_price]); } await logAction(req.user.id, req.user.name, 'PURCHASE_ORDER_CREATE', `Creó orden de compra #${newPO.id.substring(0,8)} por $${total_cost}.`); await client.query('COMMIT'); res.status(201).json(newPO); } catch (err) { await client.query('ROLLBACK'); res.status(500).json({ message: 'Error creating purchase order', error: err.message }); } finally { client.release(); } });
-purchaseOrderRouter.put('/:id/receive', async (req, res) => { const { id: purchase_order_id } = req.params; const { items_received } = req.body; const client = await pool.connect(); try { await client.query('BEGIN'); for (const item of items_received) { await client.query( 'UPDATE purchase_order_items SET quantity_received = quantity_received + $1 WHERE id = $2', [item.quantity_received, item.item_id] ); const { rows: [poItem] } = await client.query('SELECT product_id FROM purchase_order_items WHERE id = $1', [item.item_id]); await client.query( 'UPDATE products SET stock = stock + $1 WHERE id = $2', [item.quantity_received, poItem.product_id] ); } const { rows: allItems } = await client.query('SELECT quantity_ordered, quantity_received FROM purchase_order_items WHERE purchase_order_id = $1', [purchase_order_id]); const totalOrdered = allItems.reduce((sum, i) => sum + i.quantity_ordered, 0); const totalReceived = allItems.reduce((sum, i) => sum + i.quantity_received, 0); let newStatus = 'recibido_parcial'; if (totalReceived >= totalOrdered) { newStatus = 'recibido_completo'; } const { rows: [updatedPO] } = await client.query('UPDATE purchase_orders SET status = $1 WHERE id = $2 RETURNING *', [newStatus, purchase_order_id]); await logAction(req.user.id, req.user.name, 'PURCHASE_ORDER_RECEIVE', `Recibió items para la orden de compra #${purchase_order_id.substring(0,8)}.`); await client.query('COMMIT'); res.json(updatedPO); } catch (err) { await client.query('ROLLBACK'); res.status(500).json({ message: 'Error receiving purchase order items', error: err.message }); } finally { client.release(); } });
+
+purchaseOrderRouter.get('/:id', async (req, res) => {
+    try {
+        const { id } = req.params;
+        // Obtenemos la orden principal
+        const orderQuery = `
+            SELECT po.*, s.name as supplier_name
+            FROM purchase_orders po
+            JOIN suppliers s ON po.supplier_id = s.id
+            WHERE po.id = $1;
+        `;
+        const { rows: [order] } = await pool.query(orderQuery, [id]);
+        if (!order) {
+            return res.status(404).json({ message: 'Orden de compra no encontrada.' });
+        }
+
+        // Obtenemos los items de la orden
+        const itemsQuery = `
+            SELECT poi.*, p.name as product_name, p.stock as current_stock
+            FROM purchase_order_items poi
+            JOIN products p ON poi.product_id = p.id
+            WHERE poi.purchase_order_id = $1
+            ORDER BY p.name;
+        `;
+        const { rows: items } = await pool.query(itemsQuery, [id]);
+        
+        order.items = items; // Adjuntamos los items al objeto de la orden
+        res.json(order);
+
+    } catch (err) {
+        res.status(500).json({ message: 'Error fetching purchase order details', error: err.message });
+    }
+});
+
+
+purchaseOrderRouter.put('/:id/receive', async (req, res) => {
+    const { id: purchase_order_id } = req.params;
+    const { items_received } = req.body; // Esperamos un array de { item_id, quantity_received, new_cost_price }
+    const client = await pool.connect();
+
+    try {
+        await client.query('BEGIN');
+
+        for (const item of items_received) {
+            if (item.quantity_received > 0) {
+                // 1. Actualizar la cantidad recibida en el item de la orden
+                await client.query(
+                    'UPDATE purchase_order_items SET quantity_received = quantity_received + $1 WHERE id = $2',
+                    [item.quantity_received, item.item_id]
+                );
+
+                // 2. Obtener el ID del producto y el costo antiguo
+                const { rows: [poItem] } = await client.query('SELECT product_id, cost_price_at_purchase FROM purchase_order_items WHERE id = $1', [item.item_id]);
+                
+                // 3. Actualizar el stock del producto
+                await client.query(
+                    'UPDATE products SET stock = stock + $1 WHERE id = $2',
+                    [item.quantity_received, poItem.product_id]
+                );
+
+                // 4. Si el costo cambió, actualizar el costo en la tabla de productos y registrarlo
+                if (parseFloat(item.new_cost_price) !== parseFloat(poItem.cost_price_at_purchase)) {
+                    await client.query(
+                        'UPDATE products SET cost_price = $1 WHERE id = $2',
+                        [item.new_cost_price, poItem.product_id]
+                    );
+                    // (Opcional pero recomendado) Recalcular precio de venta
+                    // const newSellingPrice = calculateSellingPrice(item.new_cost_price);
+                    // await client.query('UPDATE products SET selling_price = $1 WHERE id = $2', [newSellingPrice, poItem.product_id]);
+                }
+            }
+        }
+
+        // 5. Actualizar el estado general de la orden de compra
+        const { rows: allItems } = await client.query('SELECT quantity_ordered, quantity_received FROM purchase_order_items WHERE purchase_order_id = $1', [purchase_order_id]);
+        const totalOrdered = allItems.reduce((sum, i) => sum + i.quantity_ordered, 0);
+        const totalReceived = allItems.reduce((sum, i) => sum + i.quantity_received, 0);
+
+        let newStatus = 'recibido_parcial';
+        if (totalReceived >= totalOrdered) {
+            newStatus = 'recibido_completo';
+        }
+        
+        const { rows: [updatedPO] } = await client.query('UPDATE purchase_orders SET status = $1 WHERE id = $2 RETURNING *', [newStatus, purchase_order_id]);
+        
+        await logAction(req.user.id, req.user.name, 'PURCHASE_ORDER_RECEIVE', `Recibió items para la orden de compra #${purchase_order_id.substring(0,8)}. Nuevo estado: ${newStatus}`);
+        
+        await client.query('COMMIT');
+        res.json(updatedPO);
+
+    } catch (err) {
+        await client.query('ROLLBACK');
+        console.error('Error receiving purchase order items:', err);
+        res.status(500).json({ message: 'Error al recibir los items de la orden', error: err.message });
+    } finally {
+        client.release();
+    }
+});
 apiRouter.use('/purchase-orders', purchaseOrderRouter);
 
 const customerOrderRouter = express.Router(); customerOrderRouter.use(authenticateToken);
